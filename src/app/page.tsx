@@ -1,225 +1,387 @@
 "use client";
 
-import React, { useState, useRef, useEffect } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { ArrowDown, PanelLeftOpen, SquarePen } from "lucide-react";
 import {
-  SystemMessage,
-  UserMessage,
+  Markdown,
+  MessageActions,
+  MessageError,
   ThinkingIndicator,
+  UserMessage,
 } from "@/components/design-system/message-bubble";
 import { FloatingInput } from "@/components/design-system/floating-input";
-import { ChatSidebar } from "@/components/design-system/chat-sidebar";
-
-interface Message {
-  role: "user" | "assistant";
-  content: string;
-}
-
-interface Chat {
-  id: string;
-  title: string;
-  messages: Message[];
-  lastMessage?: string;
-  updatedAt: Date;
-}
+import { ChatSidebar, Logo } from "@/components/design-system/chat-sidebar";
+import { EmptyState } from "@/components/chat/empty-state";
+import { useChats } from "@/hooks/use-chats";
+import {
+  createId,
+  deriveTitle,
+  readChatStream,
+  type Chat,
+  type Message,
+} from "@/lib/chat";
+import { cn } from "@/lib/utils";
 
 export default function Home() {
+  const { chats, setChats, updateChat, deleteChat, hydrated } = useChats();
+  const [currentChatId, setCurrentChatId] = useState<string>();
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const [chats, setChats] = useState<Chat[]>([]);
-  const [currentChatId, setCurrentChatId] = useState<string | undefined>();
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [inputValue, setInputValue] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [input, setInput] = useState("");
+  const [streamingId, setStreamingId] = useState<string | null>(null);
+  const [isAtBottom, setIsAtBottom] = useState(true);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  const abortRef = useRef<AbortController | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  const currentChat = chats.find((c) => c.id === currentChatId);
+  const messages = currentChat?.messages ?? [];
+  const isLoading = streamingId !== null;
+
+  // Sidebar starts open on desktop, closed on mobile.
+  useEffect(() => {
+    setIsSidebarOpen(window.matchMedia("(min-width: 768px)").matches);
+  }, []);
+
+  const isMobile = () => !window.matchMedia("(min-width: 768px)").matches;
+
+  // ---- Scrolling -----------------------------------------------------------
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const el = scrollRef.current;
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior });
+  }, []);
+
+  const handleScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    setIsAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 80);
   };
 
+  // Follow new content only if the reader hasn't scrolled up.
+  const lastContent = messages[messages.length - 1]?.content;
   useEffect(() => {
-    scrollToBottom();
-  }, [messages, isLoading]);
+    if (isAtBottom) scrollToBottom(isLoading ? "auto" : "smooth");
+  }, [messages.length, lastContent, isAtBottom, isLoading, scrollToBottom]);
 
-  // Update current chat in chats array whenever messages change
+  // Jump to the bottom when switching conversations.
   useEffect(() => {
-    if (currentChatId && messages.length > 0) {
-      setChats((prevChats) =>
-        prevChats.map((chat) =>
-          chat.id === currentChatId
-            ? {
-                ...chat,
-                messages,
-                title: messages[0]?.content.slice(0, 50) || "New Chat",
-                lastMessage: messages[messages.length - 1]?.content.slice(
-                  0,
-                  50
-                ),
-                updatedAt: new Date(),
-              }
-            : chat
-        )
-      );
+    scrollToBottom("auto");
+    setIsAtBottom(true);
+  }, [currentChatId, scrollToBottom]);
+
+  // ---- Chat actions --------------------------------------------------------
+  const stop = useCallback(() => abortRef.current?.abort(), []);
+
+  const newChat = useCallback(() => {
+    stop();
+    setCurrentChatId(undefined);
+    setInput("");
+    if (isMobile()) setIsSidebarOpen(false);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, [stop]);
+
+  const selectChat = (id: string) => {
+    if (id !== currentChatId) stop();
+    setCurrentChatId(id);
+    if (isMobile()) setIsSidebarOpen(false);
+  };
+
+  const removeChat = (id: string) => {
+    if (id === currentChatId) {
+      stop();
+      setCurrentChatId(undefined);
     }
-  }, [messages, currentChatId]);
+    deleteChat(id);
+  };
 
-  const handleNewChat = () => {
-    const newChatId = `chat-${Date.now()}`;
-    const newChat: Chat = {
-      id: newChatId,
-      title: "New Chat",
-      messages: [],
-      updatedAt: new Date(),
+  /** Stream an assistant reply for `history` into chat `chatId`. */
+  const streamReply = async (chatId: string, history: Message[]) => {
+    const assistant: Message = {
+      id: createId("msg"),
+      role: "assistant",
+      content: "",
+      createdAt: Date.now(),
     };
-    setChats((prev) => [newChat, ...prev]);
-    setCurrentChatId(newChatId);
-    setMessages([]);
-    setIsSidebarOpen(false);
-  };
+    updateChat(chatId, (c) => ({
+      ...c,
+      messages: [...history, assistant],
+      updatedAt: Date.now(),
+    }));
+    setStreamingId(assistant.id);
 
-  const handleSelectChat = (chatId: string) => {
-    const selectedChat = chats.find((chat) => chat.id === chatId);
-    if (selectedChat) {
-      setCurrentChatId(chatId);
-      setMessages(selectedChat.messages);
-      setIsSidebarOpen(false);
-    }
-  };
+    const controller = new AbortController();
+    abortRef.current = controller;
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!inputValue.trim() || isLoading) return;
+    const patch = (fields: Partial<Message>) =>
+      updateChat(chatId, (c) => ({
+        ...c,
+        messages: c.messages.map((m) =>
+          m.id === assistant.id ? { ...m, ...fields } : m
+        ),
+      }));
 
-    // Create a new chat if there isn't one
-    if (!currentChatId) {
-      const newChatId = `chat-${Date.now()}`;
-      const newChat: Chat = {
-        id: newChatId,
-        title: inputValue.slice(0, 50),
-        messages: [],
-        updatedAt: new Date(),
-      };
-      setChats((prev) => [newChat, ...prev]);
-      setCurrentChatId(newChatId);
-    }
-
-    const userMessage: Message = { role: "user", content: inputValue };
-    setMessages((prev) => [...prev, userMessage]);
-    setInputValue("");
-    setIsLoading(true);
-
+    let content = "";
+    let frame = 0;
     try {
-      const response = await fetch("/api/chat", {
+      const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: [...messages, userMessage] }),
+        signal: controller.signal,
+        body: JSON.stringify({
+          messages: history.map(({ role, content }) => ({ role, content })),
+        }),
       });
 
-      if (!response.ok) throw new Error("Failed to fetch response");
-      if (!response.body) throw new Error("No response body");
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.error ?? `Request failed (${res.status}).`);
+      }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let assistantMessage = "";
-
-      setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split("\n");
-
-        for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            const data = line.slice(6);
-            if (data === "[DONE]") break;
-
-            try {
-              const parsed = JSON.parse(data);
-              const content = parsed.choices[0]?.delta?.content || "";
-              assistantMessage += content;
-
-              setMessages((prev) => {
-                const newMessages = [...prev];
-                const lastMessage = newMessages[newMessages.length - 1];
-                if (lastMessage.role === "assistant") {
-                  lastMessage.content = assistantMessage;
-                }
-                return newMessages;
-              });
-            } catch (e) {
-              console.error("Error parsing JSON chunk", e);
-            }
-          }
+      for await (const delta of readChatStream(res.body, controller.signal)) {
+        content += delta;
+        // Batch UI updates to one per animation frame.
+        if (!frame) {
+          frame = requestAnimationFrame(() => {
+            frame = 0;
+            patch({ content });
+          });
         }
       }
-    } catch (error) {
-      console.error("Error sending message:", error);
+      cancelAnimationFrame(frame);
+      patch({ content });
+    } catch (err) {
+      cancelAnimationFrame(frame);
+      if (controller.signal.aborted) {
+        patch({ content });
+      } else {
+        patch({
+          content,
+          error:
+            err instanceof Error ? err.message : "The response could not be completed.",
+        });
+      }
     } finally {
-      setIsLoading(false);
+      if (abortRef.current === controller) abortRef.current = null;
+      setStreamingId((id) => (id === assistant.id ? null : id));
     }
   };
 
+  const send = (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed || isLoading) return;
+
+    const userMessage: Message = {
+      id: createId("msg"),
+      role: "user",
+      content: trimmed,
+      createdAt: Date.now(),
+    };
+
+    let chatId = currentChatId;
+    let history: Message[];
+    if (!chatId || !currentChat) {
+      const chat: Chat = {
+        id: createId("chat"),
+        title: deriveTitle(trimmed),
+        messages: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      chatId = chat.id;
+      history = [userMessage];
+      setChats((prev) => [chat, ...prev]);
+      setCurrentChatId(chat.id);
+    } else {
+      // Drop a trailing failed reply so it isn't sent back to the model.
+      const clean = currentChat.messages.filter((m) => !m.error);
+      history = [...clean, userMessage];
+    }
+
+    setInput("");
+    setIsAtBottom(true);
+    void streamReply(chatId, history);
+  };
+
+  const regenerate = () => {
+    if (!currentChat || isLoading) return;
+    const msgs = currentChat.messages;
+    const lastUser = msgs.findLastIndex((m) => m.role === "user");
+    if (lastUser === -1) return;
+    void streamReply(currentChat.id, msgs.slice(0, lastUser + 1));
+  };
+
+  // ---- Keyboard shortcuts --------------------------------------------------
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        newChat();
+      } else if ((e.metaKey || e.ctrlKey) && e.key === "\\") {
+        e.preventDefault();
+        setIsSidebarOpen((o) => !o);
+      } else if (
+        e.key === "/" &&
+        !(e.target instanceof HTMLInputElement) &&
+        !(e.target instanceof HTMLTextAreaElement)
+      ) {
+        e.preventDefault();
+        inputRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [newChat]);
+
+  // ---- Render --------------------------------------------------------------
+  const isEmpty = messages.length === 0;
+  const lastAssistantIndex = messages.findLastIndex((m) => m.role === "assistant");
+
   return (
-    <main className="flex h-screen bg-paper-50">
+    <div className="flex h-dvh overflow-hidden bg-paper-50">
       <ChatSidebar
         isOpen={isSidebarOpen}
-        onToggle={() => setIsSidebarOpen(!isSidebarOpen)}
+        onClose={() => setIsSidebarOpen(false)}
         chats={chats}
         currentChatId={currentChatId}
-        onSelectChat={handleSelectChat}
-        onNewChat={handleNewChat}
+        onSelectChat={selectChat}
+        onNewChat={newChat}
+        onDeleteChat={removeChat}
       />
 
-      <div className="flex flex-col flex-1 min-w-0">
-        <div className="flex-1 overflow-y-auto p-4 md:p-8">
-          <div className="max-w-3xl mx-auto space-y-6 pb-32">
-            {messages.length === 0 && (
-              <div className="text-center text-ink-faint mt-20">
-                <h1 className="text-4xl font-serif text-ink mb-4">
-                  Welcome back!
-                </h1>
-                <p className="text-lg">What are we going to crush today?</p>
-              </div>
-            )}
-
-            {messages.map((msg, index) => (
-              <div
-                key={index}
-                className={`flex ${
-                  msg.role === "user" ? "justify-end" : "justify-start"
-                }`}
+      <main className="relative flex min-w-0 flex-1 flex-col">
+        {/* Top bar */}
+        <header className="z-10 flex h-14 shrink-0 items-center gap-1 border-b border-transparent px-3 sm:px-4">
+          {!isSidebarOpen && (
+            <>
+              <button
+                onClick={() => setIsSidebarOpen(true)}
+                aria-label="Open sidebar"
+                title="Open sidebar (⌘\)"
+                className="rounded-lg p-2 text-ink-muted transition-colors hover:bg-paper-100 hover:text-ink"
               >
-                <div className="max-w-[85%]">
-                  {msg.role === "user" ? (
-                    <UserMessage>{msg.content}</UserMessage>
-                  ) : (
-                    <SystemMessage>{msg.content}</SystemMessage>
-                  )}
-                </div>
-              </div>
-            ))}
+                <PanelLeftOpen className="h-5 w-5" />
+              </button>
+              <button
+                onClick={newChat}
+                aria-label="New conversation"
+                title="New conversation (⌘K)"
+                className="rounded-lg p-2 text-ink-muted transition-colors hover:bg-paper-100 hover:text-ink"
+              >
+                <SquarePen className="h-5 w-5" />
+              </button>
+              <Logo className="ml-2 md:hidden" />
+            </>
+          )}
+          <h2 className="ml-2 hidden min-w-0 truncate font-serif text-base text-ink-muted md:block">
+            {currentChat?.title}
+          </h2>
+        </header>
 
-            {isLoading && (
-              <div className="flex justify-start">
-                <ThinkingIndicator />
+        {/* Conversation */}
+        <div
+          ref={scrollRef}
+          onScroll={handleScroll}
+          className="relative flex-1 overflow-y-auto"
+        >
+          {isEmpty ? (
+            <div
+              className={cn(
+                "flex min-h-full items-center justify-center px-4 pb-8 pt-4 transition-opacity duration-300",
+                hydrated ? "opacity-100" : "opacity-0"
+              )}
+            >
+              <div className="w-full max-w-2xl">
+                <EmptyState onPick={send} />
               </div>
+            </div>
+          ) : (
+            <div className="mx-auto w-full max-w-3xl px-4 pb-10 pt-4 sm:px-6">
+              <ol className="space-y-8" aria-live="polite">
+                {messages.map((msg, i) => {
+                  const streaming = msg.id === streamingId;
+                  if (msg.role === "user") {
+                    return (
+                      <li
+                        key={msg.id}
+                        className="animate-message-in flex justify-end pl-10 sm:pl-24"
+                      >
+                        <UserMessage>{msg.content}</UserMessage>
+                      </li>
+                    );
+                  }
+                  return (
+                    <li key={msg.id} className="animate-message-in group/msg">
+                      {msg.content ? (
+                        <Markdown content={msg.content} streaming={streaming} />
+                      ) : streaming ? (
+                        <ThinkingIndicator />
+                      ) : null}
+
+                      {msg.error && (
+                        <div className={cn(msg.content && "mt-4")}>
+                          <MessageError
+                            message={msg.error}
+                            onRetry={i === lastAssistantIndex ? regenerate : undefined}
+                          />
+                        </div>
+                      )}
+
+                      {!streaming && msg.content && (
+                        <MessageActions
+                          content={msg.content}
+                          onRegenerate={
+                            i === lastAssistantIndex && !isLoading ? regenerate : undefined
+                          }
+                          className={cn(
+                            "-ml-1.5 mt-2 transition-opacity",
+                            i === lastAssistantIndex
+                              ? "opacity-100"
+                              : "opacity-0 focus-within:opacity-100 group-hover/msg:opacity-100 max-md:opacity-100"
+                          )}
+                        />
+                      )}
+                    </li>
+                  );
+                })}
+              </ol>
+            </div>
+          )}
+        </div>
+
+        {/* Composer */}
+        <div className="relative shrink-0 px-3 pb-3 sm:px-6 sm:pb-5">
+          <div className="pointer-events-none absolute inset-x-0 -top-8 h-8 bg-gradient-to-t from-paper-50 to-transparent" />
+
+          <button
+            onClick={() => scrollToBottom()}
+            aria-label="Scroll to latest message"
+            className={cn(
+              "absolute -top-12 left-1/2 flex h-9 w-9 -translate-x-1/2 items-center justify-center rounded-full border border-paper-200 bg-white text-ink-muted shadow-float transition-all hover:text-brand",
+              isAtBottom || isEmpty
+                ? "pointer-events-none translate-y-2 opacity-0"
+                : "opacity-100"
             )}
-            <div ref={messagesEndRef} />
-          </div>
-        </div>
+          >
+            <ArrowDown className="h-4 w-4" />
+          </button>
 
-        <div className="fixed bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-paper-50 via-paper-50 to-transparent md:left-64">
-          <div className="max-w-3xl mx-auto">
+          <div className="mx-auto max-w-3xl">
             <FloatingInput
-              value={inputValue}
-              onChange={setInputValue}
-              onSubmit={handleSubmit}
+              inputRef={inputRef}
+              value={input}
+              onChange={setInput}
+              onSubmit={() => send(input)}
+              onStop={stop}
               isLoading={isLoading}
+              autoFocus
+              placeholder={isEmpty ? "Ask anything…" : "Reply…"}
             />
+            <p className="mt-2 text-center text-[11px] text-ink-faint">
+              AI can make mistakes. Check important information.
+            </p>
           </div>
         </div>
-      </div>
-    </main>
+      </main>
+    </div>
   );
 }

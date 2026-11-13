@@ -1,34 +1,22 @@
 import { NextResponse } from "next/server";
+import { pickMockReply } from "@/lib/mock-replies";
 
 export const runtime = "edge";
 
 const MODEL = process.env.OPENROUTER_MODEL ?? "x-ai/grok-4.1-fast:free";
 
-const DEMO_REPLY = `**You're running Folio in demo mode** — no \`OPENROUTER_API_KEY\` is set, so this reply is canned.
-
-To talk to a real model, add your key to \`.env.local\`:
-
-\`\`\`bash
-OPENROUTER_API_KEY=sk-or-...
-\`\`\`
-
-Everything else works as usual:
-
-- Conversations are saved locally and grouped by date in the sidebar
-- Press **⌘K** for a new conversation, **/** to focus the composer
-- Hover a reply to copy it, or regenerate the latest one
-- Press **Esc** (or the stop button) to cancel a reply mid-stream`;
-
 /** Stream a canned reply in OpenAI SSE format so the UI can be tried locally. */
-function demoStream() {
+function mockStream(text: string, delayMs: number, signal: AbortSignal) {
   const encoder = new TextEncoder();
-  const tokens = DEMO_REPLY.match(/\S+\s*|\s+/g) ?? [];
+  const tokens = text.match(/\S+\s*|\s+/g) ?? [];
   return new ReadableStream({
     async start(controller) {
+      await new Promise((r) => setTimeout(r, 450)); // "thinking"
       for (const token of tokens) {
+        if (signal.aborted) break;
         const chunk = { choices: [{ delta: { content: token } }] };
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-        await new Promise((r) => setTimeout(r, 18));
+        await new Promise((r) => setTimeout(r, delayMs));
       }
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       controller.close();
@@ -54,14 +42,27 @@ export async function POST(req: Request) {
   }
 
   const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) {
-    if (process.env.NODE_ENV === "production") {
-      return NextResponse.json(
-        { error: "The chat service isn't configured yet (missing API key)." },
-        { status: 503 }
-      );
+  const useMock =
+    process.env.MOCK_CHAT === "1" ||
+    (!apiKey && process.env.NODE_ENV !== "production");
+
+  if (useMock) {
+    const last = [...messages].reverse().find((m) => m?.role === "user");
+    const reply = pickMockReply(String(last?.content ?? ""));
+    if (reply.kind === "error") {
+      await new Promise((r) => setTimeout(r, 600));
+      return NextResponse.json({ error: reply.message }, { status: reply.status });
     }
-    return new Response(demoStream(), { headers: sseHeaders });
+    return new Response(mockStream(reply.text, reply.delayMs, req.signal), {
+      headers: sseHeaders,
+    });
+  }
+
+  if (!apiKey) {
+    return NextResponse.json(
+      { error: "The chat service isn't configured yet (missing API key)." },
+      { status: 503 }
+    );
   }
 
   try {

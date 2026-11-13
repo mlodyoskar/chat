@@ -160,7 +160,7 @@ export function ChatSidebar({
                               "w-full truncate rounded-lg py-2 pl-3 pr-9 text-left text-sm transition-colors",
                               active
                                 ? "bg-white font-medium text-ink shadow-paper"
-                                : "text-ink-light/90 hover:bg-paper-200/50 hover:text-ink"
+                                : "text-ink/75 hover:bg-paper-200/50 hover:text-ink"
                             )}
                           >
                             {chat.title}

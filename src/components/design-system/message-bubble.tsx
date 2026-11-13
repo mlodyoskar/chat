@@ -72,7 +72,7 @@ const markdownComponents: Components = {
     <th className="border-b border-paper-200 px-4 py-2 text-left font-semibold" {...props} />
   ),
   td: (props) => (
-    <td className="border-b border-paper-200 px-4 py-2 last:border-b-0" {...props} />
+    <td className="border-b border-paper-200 px-4 py-2 [tr:last-child>&]:border-b-0" {...props} />
   ),
 };
 

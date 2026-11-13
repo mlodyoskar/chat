@@ -1,108 +1,127 @@
 "use client";
 
-import React, { useRef, useEffect, useState } from "react";
-import { Send, Paperclip, Maximize2 } from "lucide-react";
+import React, { useLayoutEffect, useRef, useState } from "react";
+import { ArrowUp, Square } from "lucide-react";
+import { cn } from "@/lib/utils";
 
 interface FloatingInputProps {
-  value: string;
-  onChange: (value: string) => void;
-  onSubmit: (e: React.FormEvent) => void;
+  value?: string;
+  onChange?: (value: string) => void;
+  onSubmit?: () => void;
+  onStop?: () => void;
   isLoading?: boolean;
+  placeholder?: string;
+  autoFocus?: boolean;
+  inputRef?: React.RefObject<HTMLTextAreaElement | null>;
+  className?: string;
 }
 
+const MAX_HEIGHT = 240;
+
 export function FloatingInput({
-  value,
+  value: controlledValue,
   onChange,
   onSubmit,
-  isLoading,
+  onStop,
+  isLoading = false,
+  placeholder = "Ask anything…",
+  autoFocus,
+  inputRef,
+  className,
 }: FloatingInputProps) {
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const [isMaxHeight, setIsMaxHeight] = useState(false);
-  const [isExpanded, setIsExpanded] = useState(false);
+  // Works controlled (app) or uncontrolled (design-system showcase).
+  const [localValue, setLocalValue] = useState("");
+  const value = controlledValue ?? localValue;
+  const setValue = onChange ?? setLocalValue;
 
-  // Auto-resize textarea
-  useEffect(() => {
-    const textarea = textareaRef.current;
-    if (!textarea) return;
+  const fallbackRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = inputRef ?? fallbackRef;
+  const canSend = value.trim().length > 0 && !isLoading;
 
-    // Reset height to get accurate scrollHeight
-    textarea.style.height = "auto";
+  useLayoutEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, MAX_HEIGHT)}px`;
+    el.style.overflowY = el.scrollHeight > MAX_HEIGHT ? "auto" : "hidden";
+  }, [value, textareaRef]);
 
-    const lineHeight = 24; // Approximate line height in pixels
-    const maxLines = 5;
-    const maxHeight = lineHeight * maxLines;
-
-    const newHeight = Math.min(textarea.scrollHeight, maxHeight);
-    textarea.style.height = `${newHeight}px`;
-
-    // Check if we've reached max height
-    setIsMaxHeight(textarea.scrollHeight > maxHeight);
-  }, [value]);
-
-  useEffect(() => {
-    if (!isLoading && textareaRef.current) {
-      textareaRef.current.focus();
-    }
-  }, [isLoading]);
-
-  const handleMakeBigger = () => {
-    setIsExpanded(true);
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "200px";
-    }
+  const submit = () => {
+    if (!canSend) return;
+    onSubmit?.();
   };
 
   return (
-    <div className="w-full max-w-2xl mx-auto">
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          onSubmit(e);
-        }}
-        className="bg-white border border-paper-200 shadow-float rounded-lg flex items-start gap-2 p-2 transition-all duration-300 focus-within:shadow-drawer focus-within:border-brand/30 w-full"
-      >
-        <button
-          type="button"
-          className="p-3 text-ink-faint hover:text-brand hover:bg-paper-50 rounded-md transition-colors flex-shrink-0"
-          disabled={isLoading}
-        >
-          <Paperclip className="w-5 h-5" />
-        </button>
-
-        <textarea
-          ref={textareaRef}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder="Enter your message..."
-          className="flex-1 bg-transparent border-none outline-none text-ink placeholder-ink-faint font-body py-3 disabled:opacity-50 resize-none min-h-[24px] overflow-y-auto"
-          disabled={isLoading}
-          rows={1}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              onSubmit(e as unknown as React.FormEvent);
-            }
-          }}
-        />
-
-        <button
-          type="submit"
-          // disabled={!value.trim() || isLoading}
-          className="bg-brand text-white p-3 rounded-md shadow-sm hover:bg-brand-dark transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
-        >
-          <Send className="w-5 h-5" />
-        </button>
-      </form>
-
-      {isMaxHeight && !isExpanded && (
-        <button
-          onClick={handleMakeBigger}
-          className="mt-2 text-xs text-ink-faint hover:text-brand transition-colors flex items-center gap-1 ml-auto"
-        >
-          <Maximize2 className="w-3 h-3" />
-          Make bigger
-        </button>
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        submit();
+      }}
+      className={cn(
+        "group relative w-full rounded-2xl border border-paper-200 bg-white shadow-float transition-[border-color,box-shadow] duration-200",
+        "focus-within:border-brand-light/60 focus-within:shadow-[0_0_0_4px_rgb(129_140_248/0.12),var(--shadow-float)]",
+        className
       )}
-    </div>
+    >
+      <label htmlFor="chat-input" className="sr-only">
+        Message
+      </label>
+      <textarea
+        id="chat-input"
+        ref={textareaRef}
+        value={value}
+        autoFocus={autoFocus}
+        onChange={(e) => setValue(e.target.value)}
+        placeholder={placeholder}
+        rows={1}
+        enterKeyHint="send"
+        className="block w-full resize-none bg-transparent px-4 pb-14 pt-4 font-body text-[15.5px] leading-6 text-ink outline-none placeholder:text-ink-faint"
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+            e.preventDefault();
+            submit();
+          }
+          if (e.key === "Escape" && isLoading) onStop?.();
+        }}
+      />
+
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-between px-3 pb-3">
+        <span className="hidden pl-1 font-mono text-[11px] text-ink-faint sm:block">
+          {isLoading ? (
+            <>
+              <kbd className="font-mono">Esc</kbd> to stop
+            </>
+          ) : (
+            <>
+              <kbd className="font-mono">Enter</kbd> to send ·{" "}
+              <kbd className="font-mono">Shift + Enter</kbd> for a new line
+            </>
+          )}
+        </span>
+        <span className="sm:hidden" />
+
+        {isLoading ? (
+          <button
+            type="button"
+            onClick={onStop}
+            aria-label="Stop generating"
+            title="Stop generating"
+            className="pointer-events-auto flex h-9 w-9 items-center justify-center rounded-full bg-ink text-white shadow-sm transition-all hover:bg-brand-dark active:scale-95"
+          >
+            <Square className="h-3.5 w-3.5 fill-current" />
+          </button>
+        ) : (
+          <button
+            type="submit"
+            disabled={!canSend}
+            aria-label="Send message"
+            title="Send message"
+            className="pointer-events-auto flex h-9 w-9 items-center justify-center rounded-full bg-brand text-white shadow-sm transition-all hover:bg-brand-dark active:scale-95 disabled:bg-paper-200 disabled:text-ink-faint disabled:shadow-none"
+          >
+            <ArrowUp className="h-[18px] w-[18px]" strokeWidth={2.25} />
+          </button>
+        )}
+      </div>
+    </form>
   );
 }
